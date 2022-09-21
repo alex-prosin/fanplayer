@@ -163,13 +163,19 @@ typedef struct {
     int init_timeout; // w Player initialization timeout, unit ms, set to prevent stuck when opening network streaming
     int open_syncmode; // w The player is opened synchronously, calling player_open will wait for the player to initialize successfully
     int auto_reconnect; // w The timeout period for automatic reconnection when playing streaming media, in milliseconds
-    int rtsp_transport; // w rtsp transmission mode, 0-automatic, 1-udp, 2-tcp
+    int rtsp_transport; // w rtsp transmission mode, 0-automatic, 1-udp, 2-tcp, 3-http, 4-https
+    int tunnel_port;    // port for use rtsp over http
     int avts_syncmode; // wr audio and video time stamp synchronization mode, 0-automatic, 1-file playback mode, 2-live mode, do audio and video synchronization, 3-live mode, give up audio and video synchronization
     char filter_string[256]; // w custom video filter string
     char ffrdp_tx_key[32]; // aes256 encryption key used by w ffrdp protocol to send data
     char ffrdp_rx_key[32]; // aes256 decryption key used by w ffrdp protocol to receive data
     int swscale_type; // The swscale image scaling algorithm type used by w ffrender
     int waveout_device_id; // w specifies the ID of the waveout device on the windows platform
+    int (*oninit)();
+    void (*onopening)();
+    void (*onrendering)();
+    void (*onframe)();
+    void (*onreconnect)();
 } PLAYER_INIT_PARAMS;
 // The two parameters video_stream_cur and audio_stream_cur, if set to -1, the corresponding decoding action can be prohibited
 // Application scenario: When playing a video, the window returns to the background, or I just want to listen to the sound, I can set video_stream_cur to -1

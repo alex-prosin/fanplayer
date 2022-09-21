@@ -56,7 +56,7 @@ typedef struct {
     #define PS_V_SEEK     (1 << 5)  // seek video
     #define PS_CLOSE      (1 << 6)  // close player
     #define PS_RECONNECT  (1 << 7)  // reconnect
-    int              status;
+    int              status, close;
     int              seek_req ;
     int64_t          seek_pos ;
     int64_t          seek_dest;
@@ -82,6 +82,7 @@ typedef struct {
 
     // save url
     char  url[PATH_MAX];
+    char  forced_format[32];
 
     // recorder used for recording
     void  *recorder;
@@ -367,11 +368,32 @@ static int player_prepare(PLAYER *player)
     //-- for avdevice
 
     // open input file
+
+    if (strstr(player->url, "http://") == player->url ||
+        strstr(player->url, "https://") == player->url ||
+        strstr(player->forced_format, "http://") == player->forced_format ||
+        strstr(player->forced_format, "https://") == player->forced_format) {
+
+        av_dict_set(&opts, "user_agent", "avstreamplayer", 0);
+        //av_dict_set(&opts, "headers", "Referer:https://www.sample.com", 0);
+    }
+    if (strstr(player->url, "httprtsp://") == player->url ||
+        strstr(player->url, "httpsrtsp://") == player->url) {
+        av_dict_set(&opts, "user_agent", "avstreamplayer", 0);
+        av_dict_set(&opts, "rtsp_transport", "http", 0);
+
+        //e.Configuration.GlobalOptions.FlagNoBuffer = true;
+
+        // You can change the open/read timeout before the packet reading
+        // operation fails.
+        //e.Configuration.ReadTimeout = TimeSpan.FromSeconds(ReadTimeout);
+    }
+
     if (  strstr(player->url, "rtsp://" ) == player->url
        || strstr(player->url, "rtmp://" ) == player->url
        || strstr(player->url, "dshow://") == player->url) {
         if (player->init_params.rtsp_transport) {
-            av_dict_set(&opts, "rtsp_transport", player->init_params.rtsp_transport == 1 ? "udp" : "tcp", 0);
+            av_dict_set(&opts, "rtsp_transport", player->init_params.rtsp_transport == 1 ? "udp" : player->init_params.rtsp_transport == 2 ? "tcp" : "http", 0);
         }
         av_dict_set(&opts, "buffer_size"    , "1048576", 0);
         av_dict_set(&opts, "fpsprobesize"   , "2"      , 0);
@@ -410,7 +432,7 @@ static int player_prepare(PLAYER *player)
         player->read_timeout  = player->init_params.init_timeout ? player->init_params.init_timeout * 1000 : -1;
 
         if (avformat_open_input(&player->avformat_context, url, fmt, &opts) != 0) {
-            if (player->init_params.auto_reconnect > 0 && !(player->status & PS_CLOSE)) {
+            if (player->init_params.auto_reconnect > 0 && !player->close) {
                 av_log(NULL, AV_LOG_INFO, "retry to open url: %s ...\n", url);
                 av_usleep(100*1000);
             } else {
@@ -509,7 +531,7 @@ static void handle_fseek_or_reconnect(PLAYER *player, int reconnect)
 
     // wait for pause done
     while ((player->status & PAUSE_ACK) != PAUSE_ACK) {
-        if (player->status & PS_CLOSE) return;
+        if (player->close) return;
         av_usleep(20*1000);
     }
 
@@ -549,7 +571,7 @@ static void* av_demux_thread_proc(void *param)
         if (retv != 0) goto done;
     }
 
-    while (!(player->status & PS_CLOSE)) {
+    while (!player->close) {
         //++ when player seek ++//
         if (player->status & (PS_F_SEEK|PS_RECONNECT)) {
             handle_fseek_or_reconnect(player, (player->status & PS_RECONNECT) ? 1 : 0);
@@ -605,7 +627,7 @@ static void* audio_decode_thread_proc(void *param)
     int64_t   apts;
 
     player->aframe.pts = -1;
-    while (!(player->status & PS_CLOSE)) {
+    while (!player->close) {
         //++ when audio decode pause ++//
         if (player->status & PS_A_PAUSE) {
             player->status |= (PS_A_PAUSE << 16);
@@ -622,7 +644,7 @@ static void* audio_decode_thread_proc(void *param)
 
         //++ decode audio packet ++//
         apts = AV_NOPTS_VALUE;
-        while (packet->size > 0 && !(player->status & (PS_A_PAUSE|PS_CLOSE))) {
+        while (packet->size > 0 && !(player->status & PS_A_PAUSE) && !player->close) {
             int consumed = 0;
             int gotaudio = 0;
 
@@ -679,7 +701,7 @@ static void* video_decode_thread_proc(void *param)
     AVPacket *packet = NULL;
 
     player->vframe.pts = -1;
-    while (!(player->status & PS_CLOSE)) {
+    while (!player->close) {
         //++ when video decode pause ++//
         if (player->status & PS_V_PAUSE) {
             player->status |= (PS_V_PAUSE << 16);
@@ -695,7 +717,7 @@ static void* video_decode_thread_proc(void *param)
         } else datarate_video_packet(player->datarate, packet);
 
         //++ decode video packet ++//
-        while (packet->size > 0 && !(player->status & (PS_V_PAUSE|PS_CLOSE))) {
+        while (packet->size > 0 && !(player->status & PS_V_PAUSE) && !player->close) {
             int consumed = 0;
             int gotvideo = 0;
 
@@ -754,6 +776,36 @@ static void* video_decode_thread_proc(void *param)
     return NULL;
 }
 
+void player_prepareurl(void* hplayer, char* file)
+{
+    if (!hplayer) return;
+    PLAYER* player = (PLAYER*)hplayer;
+    if (_strnicmp(file, "format://", 9) == 0) {
+        // format://protocol.port?url
+        char* url = strchr(file + 9, '?');
+        if (!url) {
+            int len = url - file - 9;
+            if (len < 32) {
+                strcpy_s(player->url, _countof(player->url), ++url);
+                if (len > 0) {
+                    strncpy(player->forced_format, file + 9, len);
+                    // forced_format = protocol[.port]
+                    char* port = strchr(player->forced_format, '.');
+                    if (!port) {
+                        port[0] = '\0';
+                        if (scanf(++port, player->init_params.tunnel_port) == 0)
+                            player->init_params.tunnel_port = -1;
+                    }
+                }
+            }
+        }
+        else
+            strcpy(player->url, file = 9);
+    }
+    else
+        strcpy(player->url, file);
+}
+
 // 函数实现
 void* player_open(char *file, void *win, PLAYER_INIT_PARAMS *params)
 {
@@ -785,7 +837,8 @@ void* player_open(char *file, void *win, PLAYER_INIT_PARAMS *params)
     player->cmnvars.init_params = &player->init_params;
 
     //++ for player_prepare
-    strcpy(player->url, file);
+    player_prepareurl(player, file);
+
 #ifdef WIN32
     player->cmnvars.winmsg = win;
 #endif
@@ -848,7 +901,8 @@ void player_close(void *hplayer)
     player->read_timeout = 0;
 
     // set close flag
-    player->status |= PS_CLOSE;
+    player->close = 1;
+    // stop render
     render_setparam(player->render, PARAM_RENDER_STOP, NULL);
 
     // wait audio/video demuxing thread exit
@@ -895,7 +949,7 @@ void player_play(void *hplayer)
 {
     PLAYER *player = (PLAYER*)hplayer;
     if (!hplayer) return;
-    player->status &= PS_CLOSE;
+    player->status = 0;
     render_pause(player->render, 0);
     datarate_reset(player->datarate);
 }
@@ -1087,6 +1141,7 @@ void player_load_params(PLAYER_INIT_PARAMS *params, char *str)
     params->open_syncmode       = atoi(parse_params(str, "open_syncmode"      , value, sizeof(value)) ? value : "0");
     params->auto_reconnect      = atoi(parse_params(str, "auto_reconnect"     , value, sizeof(value)) ? value : "0");
     params->rtsp_transport      = atoi(parse_params(str, "rtsp_transport"     , value, sizeof(value)) ? value : "0");
+    params->tunnel_port         = atoi(parse_params(str, "tunnel_port"        , value, sizeof(value)) ? value : "0");
     params->avts_syncmode       = atoi(parse_params(str, "avts_syncmode"      , value, sizeof(value)) ? value : "0");
     params->swscale_type        = atoi(parse_params(str, "swscale_type"       , value, sizeof(value)) ? value : "0");
     params->waveout_device_id   = atoi(parse_params(str, "waveout_device_id"  , value, sizeof(value)) ? value : "0");
